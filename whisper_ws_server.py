@@ -9,20 +9,16 @@ Two streams:
 Binary frame from client (mic):
     uint32 LE  sample_rate
     uint32 LE  num_samples
-    uint32 LE  flags (1 = enrollment recording)
+    uint32 LE  flags (reserved, 0)
     float32 LE * num_samples
 
 JSON command from client (control):
     {"action":"subscribe","role":"system"}      — register as system-audio listener
-    {"action":"enroll_user"}                    — next mic frame is enrollment, save as user embedding
-    {"action":"clear_enrollment"}               — drop saved user embedding
+    {"action":"status"}                         — query server capabilities
 
 Server response (mic transcription / system push):
     {"text":"...", "lang":"ru", "dur_ms":N, "source":"mic|system",
-     "is_question":bool, "is_user":bool|null, "filtered":"" or "<dropped text>"}
-
-Run:
-    .venv\\Scripts\\python.exe whisper_ws_server.py
+     "is_question":bool, "filtered":"" or "<dropped text>"}
 """
 
 import argparse
@@ -31,16 +27,13 @@ import json
 import logging
 import re
 import struct
-import sys
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 import websockets
 from faster_whisper import WhisperModel
 
-# Optional dependencies (graceful degradation)
 try:
     import soundcard as sc
     SOUNDCARD_OK = True
@@ -48,24 +41,11 @@ except Exception as _e:
     SOUNDCARD_OK = False
     _SOUNDCARD_IMPORT_ERR = _e
 
-try:
-    import os as _os
-    _os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    from speechbrain.inference import EncoderClassifier
-    from speechbrain.utils.fetching import LocalStrategy
-    import torch
-    SPEAKERID_OK = True
-except Exception as _e:
-    SPEAKERID_OK = False
-    _SPEAKERID_IMPORT_ERR = _e
-    LocalStrategy = None
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("whisper-ws")
 
 HEADER_FMT = "<III"
 HEADER_LEN = struct.calcsize(HEADER_FMT)
-FLAG_ENROLLMENT = 1 << 0
 
 INITIAL_PROMPT = (
     "DevOps собеседование на русском с английскими техническими терминами. "
@@ -73,8 +53,6 @@ INITIAL_PROMPT = (
     "NGINX, PostgreSQL, Redis, AWS, Azure, GCP. Linux: inode, hardlink, symlink, fstab, "
     "LVM, ext4, systemd, GRUB, page cache. Network: TLS, BGP, OSPF, DNS, TCP, HTTP, HTTPS."
 )
-
-# ── Hallucination filter ─────────────────────────────────────────────────────
 
 HALLUCINATION_PATTERNS = [
     re.compile(p, re.IGNORECASE)
@@ -93,22 +71,22 @@ HALLUCINATION_PATTERNS = [
 ]
 
 
-def has_repetition(text: str, ngram: int = 3) -> bool:
+def has_repetition(text, ngram=3):
     if not text:
         return False
     words = re.findall(r"\w+", text.lower())
     if len(words) < ngram * 2:
         return False
-    seen: dict[tuple, int] = {}
+    seen = {}
     for i in range(len(words) - ngram + 1):
-        gram = tuple(words[i : i + ngram])
+        gram = tuple(words[i:i + ngram])
         seen[gram] = seen.get(gram, 0) + 1
         if seen[gram] >= 3:
             return True
     return False
 
 
-def is_hallucination(text: str) -> bool:
+def is_hallucination(text):
     if not text:
         return False
     stripped = text.strip().rstrip(".,!?\"'»« ")
@@ -121,8 +99,6 @@ def is_hallucination(text: str) -> bool:
         return True
     return False
 
-
-# ── Question detection ───────────────────────────────────────────────────────
 
 RU_INTERROG = re.compile(
     r"^(что|как|почему|зачем|когда|где|кто|чем|какой|какая|какие|какое|"
@@ -143,7 +119,7 @@ LOOKUP_TRIGGERS = re.compile(
 )
 
 
-def is_question(text: str) -> bool:
+def is_question(text):
     text = (text or "").strip()
     if not text:
         return False
@@ -159,108 +135,21 @@ def is_question(text: str) -> bool:
     return False
 
 
-# ── Speaker identification ───────────────────────────────────────────────────
-
-
-class SpeakerID:
-    """Lazy-loaded: ECAPA model only downloaded when needed (first enroll or classify)."""
-
-    def __init__(self, enroll_path: Path):
-        self.enroll_path = enroll_path
-        self.user_emb = None
-        self.embedder = None
-        self._load_attempted = False
-        if not SPEAKERID_OK:
-            log.warning(f"SpeakerID disabled — speechbrain not available: {_SPEAKERID_IMPORT_ERR}")
-            return
-        # If enrollment file exists, try to load it (but don't load model yet)
-        if self.enroll_path.exists():
-            try:
-                arr = np.load(self.enroll_path)
-                self.user_emb = torch.from_numpy(arr).float()
-                log.info(f"SpeakerID: enrollment found at {self.enroll_path}")
-            except Exception:
-                log.exception("SpeakerID: failed to load enrollment file")
-        log.info("SpeakerID: lazy mode — model downloads on first use")
-
-    def _ensure_loaded(self) -> bool:
-        if self.embedder is not None:
-            return True
-        if self._load_attempted:
-            return False
-        self._load_attempted = True
-        if not SPEAKERID_OK:
-            return False
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        log.info(f"SpeakerID: loading ECAPA-TDNN on {device} (first use)")
-        try:
-            self.embedder = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": device},
-                savedir=str(self.enroll_path.parent / "ecapa_cache"),
-                local_strategy=LocalStrategy.COPY,
-            )
-            log.info("SpeakerID: model loaded")
-            return True
-        except Exception as e:
-            log.warning(f"SpeakerID: model load failed: {e}")
-            self.embedder = None
-            return False
-
-    def enroll(self, samples_16k: np.ndarray):
-        if not self._ensure_loaded():
-            return False
-        if len(samples_16k) < 16000 * 5:
-            log.warning(f"Enrollment too short ({len(samples_16k)/16000:.1f}s), need >=5s")
-            return False
-        wav = torch.from_numpy(samples_16k).unsqueeze(0)
-        emb = self.embedder.encode_batch(wav).squeeze().cpu()
-        emb = emb / (emb.norm() + 1e-9)
-        self.user_emb = emb
-        np.save(self.enroll_path, emb.numpy())
-        log.info(f"Enrollment saved to {self.enroll_path}")
-        return True
-
-    def clear(self):
-        self.user_emb = None
-        if self.enroll_path.exists():
-            self.enroll_path.unlink()
-        log.info("Enrollment cleared")
-
-    def is_user(self, samples_16k: np.ndarray, threshold: float = 0.45):
-        """Return (bool, sim) if enrolled and model loaded, None otherwise."""
-        if self.user_emb is None:
-            return None
-        if not self._ensure_loaded():
-            return None
-        if len(samples_16k) < 16000:
-            return None
-        wav = torch.from_numpy(samples_16k).unsqueeze(0)
-        emb = self.embedder.encode_batch(wav).squeeze().cpu()
-        emb = emb / (emb.norm() + 1e-9)
-        sim = torch.dot(emb, self.user_emb).item()
-        return sim > threshold, sim
-
-
-# ── Transcriber ──────────────────────────────────────────────────────────────
-
-
 class Transcriber:
-    def __init__(self, model_name: str, device: str, compute_type: str, language: str):
+    def __init__(self, model_name, device, compute_type, language):
         log.info(f"Loading faster-whisper model={model_name} device={device} compute_type={compute_type}")
         t0 = time.perf_counter()
         self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
         log.info(f"Model loaded in {time.perf_counter()-t0:.2f}s")
         self.language = language
 
-    def transcribe(self, samples: np.ndarray, sr: int) -> dict:
+    def transcribe(self, samples, sr):
         if sr != 16000:
             ratio = 16000 / sr
             new_len = int(len(samples) * ratio)
             xp = np.linspace(0, len(samples), num=len(samples), endpoint=False)
             x = np.linspace(0, len(samples), num=new_len, endpoint=False)
             samples = np.interp(x, xp, samples).astype(np.float32)
-            sr = 16000
         t0 = time.perf_counter()
         segments, info = self.model.transcribe(
             samples,
@@ -295,14 +184,9 @@ class Transcriber:
         return {"text": text, "lang": info.language, "dur_ms": dur_ms, "filtered": filtered}
 
 
-# ── System audio capture loop ────────────────────────────────────────────────
-
-
-def system_audio_capture_thread(out_queue: "queue.Queue", stop_event: threading.Event,
-                                 sample_rate: int = 16000, chunk_seconds: float = 2.5):
-    """Background thread: capture system loopback in 2.5s chunks, push to queue."""
+def system_audio_capture_thread(out_queue, stop_event, sample_rate=16000, chunk_seconds=2.5):
     if not SOUNDCARD_OK:
-        log.warning(f"System audio capture disabled (soundcard import: {_SOUNDCARD_IMPORT_ERR})")
+        log.warning(f"System audio capture disabled (soundcard: {_SOUNDCARD_IMPORT_ERR})")
         return
     try:
         spk = sc.default_speaker()
@@ -322,19 +206,12 @@ def system_audio_capture_thread(out_queue: "queue.Queue", stop_event: threading.
         log.exception("system audio capture thread crashed at startup")
 
 
-# ── WebSocket server ─────────────────────────────────────────────────────────
-
-
 class Server:
-    def __init__(self, transcriber: Transcriber, speaker_id: SpeakerID):
+    def __init__(self, transcriber):
         self.transcriber = transcriber
-        self.speaker_id = speaker_id
-        self.system_subscribers: set = set()
-        self.lock = asyncio.Lock()
-        self.enrollment_buffers: dict = {}  # ws -> list of np.ndarray
-        self.enrollment_active: dict = {}   # ws -> bool
+        self.system_subscribers = set()
 
-    async def broadcast_system(self, payload: dict):
+    async def broadcast_system(self, payload):
         msg = json.dumps(payload)
         dead = []
         for ws in list(self.system_subscribers):
@@ -345,22 +222,18 @@ class Server:
         for ws in dead:
             self.system_subscribers.discard(ws)
 
-    async def system_audio_loop(self, queue: "queue.Queue"):
-        """Async consumer of system audio chunks. Transcribes and broadcasts."""
+    async def system_audio_loop(self, queue):
         loop = asyncio.get_running_loop()
         while True:
             try:
-                # Read chunk from thread queue (blocking, but in executor)
                 mono = await loop.run_in_executor(None, queue.get)
                 peak = float(np.abs(mono).max())
                 rms = float(np.sqrt(np.mean(mono * mono)))
                 if peak < 0.015 and rms < 0.005:
-                    continue  # silence
+                    continue
                 if not self.system_subscribers:
-                    continue  # nobody listening, skip transcribe
-                result = await loop.run_in_executor(
-                    None, self.transcriber.transcribe, mono, 16000
-                )
+                    continue
+                result = await loop.run_in_executor(None, self.transcriber.transcribe, mono, 16000)
                 result["source"] = "system"
                 result["is_question"] = is_question(result.get("text", ""))
                 result["peak"] = round(peak, 4)
@@ -388,11 +261,9 @@ class Server:
             log.exception("connection handler error")
         finally:
             self.system_subscribers.discard(ws)
-            self.enrollment_active.pop(ws, None)
-            self.enrollment_buffers.pop(ws, None)
             log.info(f"client disconnected: {peer}")
 
-    async def handle_command(self, ws, msg: str):
+    async def handle_command(self, ws, msg):
         try:
             cmd = json.loads(msg)
         except json.JSONDecodeError:
@@ -404,55 +275,27 @@ class Server:
             if role == "system":
                 self.system_subscribers.add(ws)
                 await ws.send(json.dumps({"ok": True, "subscribed": "system"}))
-                log.info(f"client subscribed to system audio")
-        elif action == "enroll_user":
-            self.enrollment_active[ws] = True
-            self.enrollment_buffers[ws] = []
-            await ws.send(json.dumps({"ok": True, "enrollment": "recording"}))
-            log.info("enrollment started for client")
-        elif action == "finish_enrollment":
-            if self.enrollment_active.get(ws):
-                self.enrollment_active[ws] = False
-                buf = self.enrollment_buffers.pop(ws, [])
-                if buf:
-                    merged = np.concatenate(buf)
-                    log.info(f"enrollment finalize: {len(merged)/16000:.1f}s of audio")
-                    if self.speaker_id:
-                        ok = self.speaker_id.enroll(merged)
-                        await ws.send(json.dumps({"ok": ok, "enrollment": "saved" if ok else "too_short"}))
-                    else:
-                        await ws.send(json.dumps({"ok": False, "error": "speaker_id unavailable"}))
-                else:
-                    await ws.send(json.dumps({"ok": False, "error": "no audio received"}))
-            else:
-                await ws.send(json.dumps({"ok": False, "error": "no active enrollment"}))
-        elif action == "clear_enrollment":
-            if self.speaker_id:
-                self.speaker_id.clear()
-            await ws.send(json.dumps({"ok": True, "enrollment": "cleared"}))
+                log.info("client subscribed to system audio")
         elif action == "status":
             await ws.send(json.dumps({
                 "ok": True,
                 "soundcard": SOUNDCARD_OK,
-                "speaker_id": SPEAKERID_OK and self.speaker_id is not None,
-                "enrolled": self.speaker_id is not None and self.speaker_id.user_emb is not None,
                 "system_subscribers": len(self.system_subscribers),
             }))
         else:
             await ws.send(json.dumps({"error": f"unknown action: {action}"}))
 
-    async def handle_audio_frame(self, ws, frame: bytes):
+    async def handle_audio_frame(self, ws, frame):
         if len(frame) < HEADER_LEN:
             await ws.send(json.dumps({"error": "frame too short"}))
             return
-        sr, n, flags = struct.unpack_from(HEADER_FMT, frame, 0)
+        sr, n, _flags = struct.unpack_from(HEADER_FMT, frame, 0)
         expected = HEADER_LEN + n * 4
         if len(frame) < expected:
-            await ws.send(json.dumps({"error": f"frame truncated"}))
+            await ws.send(json.dumps({"error": "frame truncated"}))
             return
         samples = np.frombuffer(frame, dtype=np.float32, offset=HEADER_LEN, count=n).copy()
 
-        # Resample to 16k if needed
         if sr != 16000:
             ratio = 16000 / sr
             new_len = int(len(samples) * ratio)
@@ -460,19 +303,9 @@ class Server:
             x = np.linspace(0, len(samples), num=new_len, endpoint=False)
             samples = np.interp(x, xp, samples).astype(np.float32)
 
-        # Enrollment mode: just collect, don't transcribe
-        if self.enrollment_active.get(ws):
-            self.enrollment_buffers.setdefault(ws, []).append(samples)
-            total = sum(len(b) for b in self.enrollment_buffers[ws])
-            await ws.send(json.dumps({"enrollment": "collecting", "seconds": round(total / 16000, 1)}))
-            return
-
-        # Normal mic transcription
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(
-                None, self.transcriber.transcribe, samples, 16000
-            )
+            result = await loop.run_in_executor(None, self.transcriber.transcribe, samples, 16000)
         except Exception as e:
             log.exception("transcribe failed")
             await ws.send(json.dumps({"error": str(e)}))
@@ -480,26 +313,8 @@ class Server:
 
         result["source"] = "mic"
         result["is_question"] = is_question(result.get("text", ""))
-
-        # Speaker ID check
-        if self.speaker_id and self.speaker_id.user_emb is not None:
-            try:
-                ret = self.speaker_id.is_user(samples)
-                if ret is not None:
-                    is_user, sim = ret
-                    result["is_user"] = bool(is_user)
-                    result["speaker_sim"] = round(sim, 3)
-            except Exception:
-                log.exception("speaker_id check failed")
-        else:
-            result["is_user"] = None
-
-        log.info(f"[mic] {result['dur_ms']}ms is_q={result['is_question']} "
-                 f"is_user={result.get('is_user')} text={result.get('text','')!r}")
+        log.info(f"[mic] {result['dur_ms']}ms is_q={result['is_question']} text={result.get('text','')!r}")
         await ws.send(json.dumps(result))
-
-
-# ── Main ────────────────────────────────────────────────────────────────────
 
 
 async def main():
@@ -507,26 +322,15 @@ async def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9876)
     ap.add_argument("--model", default="large-v3-turbo")
-    ap.add_argument("--device", default="cuda", choices=["auto", "cuda", "cpu"])
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--compute-type", default="float16")
     ap.add_argument("--language", default="ru")
-    ap.add_argument("--no-system-audio", action="store_true",
-                    help="Disable system audio loopback capture")
-    ap.add_argument("--enrollment-path", default=None,
-                    help="Path to save enrolled user voice embedding")
+    ap.add_argument("--no-system-audio", action="store_true")
     args = ap.parse_args()
 
     transcriber = Transcriber(args.model, args.device, args.compute_type, args.language)
+    server = Server(transcriber)
 
-    if args.enrollment_path:
-        enroll_path = Path(args.enrollment_path)
-    else:
-        enroll_path = Path(__file__).parent / "enrolled_user.npy"
-    speaker_id = SpeakerID(enroll_path)
-
-    server = Server(transcriber, speaker_id)
-
-    # Start system audio capture thread + async consumer
     import queue
     sysaudio_queue = queue.Queue(maxsize=20)
     stop_event = threading.Event()
@@ -539,8 +343,7 @@ async def main():
         thread.start()
         asyncio.create_task(server.system_audio_loop(sysaudio_queue))
 
-    log.info(f"Listening on ws://{args.host}:{args.port}  "
-             f"(soundcard={SOUNDCARD_OK}, speaker_id={SPEAKERID_OK})")
+    log.info(f"Listening on ws://{args.host}:{args.port}  (soundcard={SOUNDCARD_OK})")
 
     async with websockets.serve(
         server.handle_connection,
