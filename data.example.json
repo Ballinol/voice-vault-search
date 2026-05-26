@@ -8,5 +8,7 @@
   "audioSource": "mic",
   "topK": 5,
   "scanFolder": "",
-  "requireQuestionMarker": false
+  "requireQuestionMarker": false,
+  "autoSplitOpen": false,
+  "autoSplitCount": 3
 }
