@@ -1,0 +1,12 @@
+{
+  "deepgramApiKey": "",
+  "language": "ru",
+  "endpointingMs": 600,
+  "utteranceEndMs": 1000,
+  "autoModeDefault": false,
+  "autoMinChars": 12,
+  "audioSource": "mic",
+  "topK": 5,
+  "scanFolder": "",
+  "requireQuestionMarker": false
+}

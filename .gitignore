@@ -1,0 +1,28 @@
+# Python venv (junction or real)
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model caches (auto-downloaded on first run)
+ecapa_cache/
+models/
+
+# Personal data — never commit
+data.json
+enrolled_user.npy
+
+# Backups
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

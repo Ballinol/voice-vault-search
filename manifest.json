@@ -1,0 +1,9 @@
+{
+  "id": "voice-vault-search",
+  "name": "Voice Vault Search",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Голосовой семантический поиск по vault: говоришь вопрос — открывается релевантная заметка с прыжком к нужному заголовку. С авто-режимом для собеседований.",
+  "author": "interview-plugin",
+  "isDesktopOnly": true
+}
