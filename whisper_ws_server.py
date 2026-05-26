@@ -135,12 +135,33 @@ def is_question(text):
     return False
 
 
+def resolve_device_compute(device, compute_type):
+    """Pick a sane device + compute_type. float16 on CPU is slow; use int8 instead."""
+    has_cuda = False
+    try:
+        import ctranslate2
+        has_cuda = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        pass
+    if device == "auto":
+        device = "cuda" if has_cuda else "cpu"
+    if compute_type == "auto":
+        compute_type = "float16" if device == "cuda" else "int8"
+    # Guard: float16 on CPU is a footgun — downgrade to int8
+    if device == "cpu" and compute_type in ("float16", "fp16"):
+        log.warning("float16 on CPU is slow — switching to int8")
+        compute_type = "int8"
+    return device, compute_type
+
+
 class Transcriber:
     def __init__(self, model_name, device, compute_type, language):
+        device, compute_type = resolve_device_compute(device, compute_type)
         log.info(f"Loading faster-whisper model={model_name} device={device} compute_type={compute_type}")
         t0 = time.perf_counter()
         self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
         log.info(f"Model loaded in {time.perf_counter()-t0:.2f}s")
+        self.device = device
         self.language = language
 
     def transcribe(self, samples, sr):
@@ -151,11 +172,12 @@ class Transcriber:
             x = np.linspace(0, len(samples), num=new_len, endpoint=False)
             samples = np.interp(x, xp, samples).astype(np.float32)
         t0 = time.perf_counter()
+        _beam = 5 if self.device == "cuda" else 1
         segments, info = self.model.transcribe(
             samples,
             language=self.language,
-            beam_size=5,
-            best_of=5,
+            beam_size=_beam,
+            best_of=_beam,
             patience=1.0,
             length_penalty=1.0,
             repetition_penalty=1.15,
@@ -323,7 +345,7 @@ async def main():
     ap.add_argument("--port", type=int, default=9876)
     ap.add_argument("--model", default="large-v3-turbo")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument("--compute-type", default="float16")
+    ap.add_argument("--compute-type", default="auto")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--no-system-audio", action="store_true")
     args = ap.parse_args()
