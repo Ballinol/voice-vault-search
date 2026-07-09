@@ -16,7 +16,7 @@ echo.
 pause
 
 echo.
-echo [1/2] Проверяю модель qwen2.5:7b-instruct (при первом запуске скачает ~4.7 ГБ)...
+echo [1/2] Скачиваю модели Ollama (при первом запуске ~1 ГБ + ~4.7 ГБ)...
 where ollama >nul 2>nul || (
   echo.
   echo [!] Ollama не найдена. Установи её: https://ollama.com/download
@@ -24,8 +24,12 @@ where ollama >nul 2>nul || (
   echo.
   pause & exit /b 1
 )
+echo   - qwen2.5:1.5b  (вытаскивает вопрос из речи при поиске)
+ollama pull qwen2.5:1.5b
+if errorlevel 1 ( echo [!] Не удалось получить qwen2.5:1.5b. & pause & exit /b 1 )
+echo   - qwen2.5:7b-instruct  (генерация вопросов для заметок)
 ollama pull qwen2.5:7b-instruct
-if errorlevel 1 ( echo [!] Не удалось получить модель. & pause & exit /b 1 )
+if errorlevel 1 ( echo [!] Не удалось получить qwen2.5:7b-instruct. & pause & exit /b 1 )
 
 echo.
 echo [2/2] Генерирую вопросы для заметок ^(разово, подожди несколько минут^)...
