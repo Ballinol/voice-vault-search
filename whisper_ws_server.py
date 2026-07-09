@@ -25,10 +25,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import struct
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import websockets
@@ -51,7 +53,18 @@ INITIAL_PROMPT = (
     "DevOps собеседование на русском с английскими техническими терминами. "
     "Terraform, Ansible, Kubernetes, Docker, Helm, GitLab, Jenkins, Prometheus, Grafana, "
     "NGINX, PostgreSQL, Redis, AWS, Azure, GCP. Linux: inode, hardlink, symlink, fstab, "
-    "LVM, ext4, systemd, GRUB, page cache. Network: TLS, BGP, OSPF, DNS, TCP, HTTP, HTTPS."
+    "LVM, ext4, systemd, GRUB, page cache. Network: TLS, BGP, OSPF, DNS, TCP, HTTP, HTTPS. "
+    "Русские термины: идемпотентность, идемпотентный, отказоустойчивость, "
+    "согласованность, оркестрация, контейнеризация, троттлинг."
+)
+
+# Редкие русские доменные слова, которые Whisper систематически слышит криво
+# ("идемпотентность" → "идемпатентность"/"и дед потентность"/"идентичность").
+# hotwords — самый прицельный рычаг faster-whisper для смещения к ним; работает
+# вместе с initial_prompt (отключается только при заданном prefix, его мы не задаём).
+HOTWORDS = (
+    "идемпотентность идемпотентный отказоустойчивость согласованность "
+    "оркестрация контейнеризация троттлинг"
 )
 
 HALLUCINATION_PATTERNS = [
@@ -191,6 +204,7 @@ class Transcriber:
                 "threshold": 0.5,
             },
             initial_prompt=INITIAL_PROMPT,
+            hotwords=HOTWORDS,
             no_speech_threshold=0.5,
             log_prob_threshold=-1.0,
             compression_ratio_threshold=1.8,
@@ -226,6 +240,168 @@ def system_audio_capture_thread(out_queue, stop_event, sample_rate=16000, chunk_
                     time.sleep(0.5)
     except Exception:
         log.exception("system audio capture thread crashed at startup")
+
+
+# ── Cross-encoder reranker ───────────────────────────────────────────────────
+# Ленивый: модель грузится при первом запросе rerank. По умолчанию на CPU,
+# чтобы не делить 6 ГБ GPU с Whisper. Читает тела заметок по пути (от корня волта).
+RERANK_MODEL  = os.getenv("RERANK_MODEL", "jinaai/jina-reranker-v2-base-multilingual")
+# GPU: реранк 20 коротких документов ~0.3с; рядом с Whisper (1.6+1.1 ГБ < 6 ГБ).
+# На CPU та же модель — десятки секунд, для live не годится. При OOM загрузка
+# упадёт → _get_reranker вернёт None → поиск тихо откатится на dense (e5).
+RERANK_DEVICE = os.getenv("RERANK_DEVICE", "cuda")
+_VAULT_ROOT   = Path(__file__).resolve().parents[3]   # .../voice-vault-search → Obsidian Vault
+_RERANKER = None
+_RERANKER_TRIED = False
+_RE_HTML = re.compile(r"<!--.*?-->", re.DOTALL)
+_RE_IMG  = re.compile(r"!\[\[[^\]]*\]\]")
+_RE_WS   = re.compile(r"\s+")
+
+
+def _patch_xlmr_for_jina():
+    try:
+        import transformers.models.xlm_roberta.modeling_xlm_roberta as xlmr
+    except Exception:
+        return
+    if not hasattr(xlmr, "create_position_ids_from_input_ids"):
+        import torch
+        def _f(input_ids, padding_idx, past_key_values_length=0):
+            mask = input_ids.ne(padding_idx).int()
+            incr = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length) * mask
+            return incr.long() + padding_idx
+        xlmr.create_position_ids_from_input_ids = _f
+
+
+def _get_reranker():
+    global _RERANKER, _RERANKER_TRIED
+    if _RERANKER is not None or _RERANKER_TRIED:
+        return _RERANKER
+    _RERANKER_TRIED = True
+    try:
+        _patch_xlmr_for_jina()
+        from sentence_transformers import CrossEncoder
+        log.info(f"Loading reranker {RERANK_MODEL} on {RERANK_DEVICE} (first use)")
+        try:
+            _RERANKER = CrossEncoder(RERANK_MODEL, max_length=512, device=RERANK_DEVICE,
+                                     trust_remote_code=True, model_kwargs={"use_flash_attn": False})
+        except TypeError:
+            _RERANKER = CrossEncoder(RERANK_MODEL, max_length=512, device=RERANK_DEVICE,
+                                     trust_remote_code=True)
+        log.info("reranker loaded")
+    except Exception as e:
+        log.warning(f"reranker load failed: {e}")
+        _RERANKER = None
+    return _RERANKER
+
+
+def _doc_text(path, heading, max_chars=1400):
+    p = Path(path)
+    if not p.is_absolute():
+        p = _VAULT_ROOT / path
+    try:
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    raw = _RE_IMG.sub(" ", _RE_HTML.sub(" ", raw))
+    stem = p.stem
+    label = f"{stem} > {heading}" if heading else stem
+    return (label + ". " + _RE_WS.sub(" ", raw).strip())[:max_chars]
+
+
+# ── Акцент на заголовок ───────────────────────────────────────────────────────
+# Заголовки заметок у пользователя — это вопросы ("Как диагностировать ..."),
+# сильнейший сигнал. К скору кросс-энкодера добавляем бонус за долю слов запроса,
+# нашедшихся в заголовке (+heading). Морфологию РУ ловим грубо — по префиксу 5 букв.
+RERANK_TITLE_BOOST = float(os.getenv("RERANK_TITLE_BOOST", "0.15"))
+_RE_WORD = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+_STOP = {
+    "что", "такое", "как", "зачем", "почему", "когда", "где", "кто", "чем", "для",
+    "это", "его", "или", "над", "под", "при", "про", "так", "там", "если", "ещё",
+    "нужен", "нужна", "нужно", "бывают", "есть", "вообще", "может", "можно",
+    "the", "and", "for", "what", "how", "why", "does", "are", "you", "your",
+}
+
+
+def _title_words(path, heading):
+    stem = Path(path).stem
+    return _RE_WORD.findall((stem + " " + (heading or "")).lower())
+
+
+def _title_bonus(query, path, heading):
+    qs = [w for w in _RE_WORD.findall(query.lower()) if len(w) >= 4 and w not in _STOP]
+    if not qs:
+        return 0.0
+    tw = _title_words(path, heading)
+    if not tw:
+        return 0.0
+    hit = 0
+    for q in qs:
+        qp = q[:5]
+        if any(t.startswith(qp) or q.startswith(t[:5]) for t in tw):
+            hit += 1
+    return hit / len(qs)
+
+
+# ── Извлечение вопроса из буфера (локальная LLM через Ollama) ──────────────────
+# В живом собесе вопрос тонет в болтовне ("...Я сегодня сто процентов..."). Лёгкая
+# модель (вход крошечный) вытаскивает сам вопрос ДО поиска, чтобы e5+реранк шли по
+# чистой фразе. При недоступности Ollama — тихий откат на исходный буфер.
+EXTRACT_ENABLED = os.getenv("EXTRACT_QUESTION", "1") != "0"
+EXTRACT_MODEL   = os.getenv("EXTRACT_MODEL", "qwen2.5:1.5b")
+# Нативный Ollama-эндпоинт — чтобы передать options (num_gpu) и keep_alive.
+EXTRACT_URL     = os.getenv("EXTRACT_URL", "http://localhost:11434/api/chat")
+EXTRACT_TIMEOUT = float(os.getenv("EXTRACT_TIMEOUT", "12.0"))  # запас на холодную загрузку (CPU медленнее)
+# num_gpu=99 → извлекатель на GPU (тёплый ~1.5с vs ~2с CPU). Безопасно: Ollama —
+# ОТДЕЛЬНЫЙ процесс, не конфликтует с Whisper; память Whisper1.6+qwen1.1+e5 0.5=3.2/6 ГБ.
+# Если понадобится освободить VRAM — EXTRACT_NUM_GPU=0 вернёт извлекатель на CPU.
+EXTRACT_NUM_GPU = int(os.getenv("EXTRACT_NUM_GPU", "99"))
+_EXTRACT_SYSTEM = (
+    "Из расшифровки устной речи (техническое собеседование) выдели заданный "
+    "вопрос и верни его КРАТКО, сохраняя ключевые термины. НЕ отвечай на вопрос и "
+    "НЕ добавляй никаких фактов — только сама тема/вопрос. Если явного вопроса "
+    "нет — верни исходный текст без изменений."
+)
+# Few-shot: маленькие модели без примеров склонны ОТВЕЧАТЬ, а не извлекать.
+_EXTRACT_SHOTS = [
+    ("ну смотри я вот думаю когда деплоим как там с идемпотентностью в ансибле вообще",
+     "идемпотентность в ansible"),
+    ("Что такое namespace в Кубере? Я сегодня сто процентов поддерживаю. Такие я четыре раза нажал",
+     "что такое namespace в kubernetes"),
+    ("так вот про сетевую модель osi сколько там уровней а",
+     "сколько уровней в модели osi"),
+    ("ага понятно спасибо давай дальше",
+     "ага понятно спасибо давай дальше"),
+]
+
+
+def _extract_question(query):
+    q = (query or "").strip()
+    if not (EXTRACT_ENABLED and q):
+        return q
+    try:
+        import requests
+        msgs = [{"role": "system", "content": _EXTRACT_SYSTEM}]
+        for u, a in _EXTRACT_SHOTS:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": q})
+        resp = requests.post(
+            EXTRACT_URL,
+            json={
+                "model": EXTRACT_MODEL,
+                "messages": msgs,
+                "stream": False,
+                "keep_alive": "30m",
+                "options": {"temperature": 0, "num_predict": 48, "num_gpu": EXTRACT_NUM_GPU},
+            },
+            timeout=EXTRACT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        out = resp.json()["message"]["content"].strip().strip('"').strip()
+        return out or q
+    except Exception as e:
+        log.warning(f"extract_question failed: {e}")
+        return q
 
 
 class Server:
@@ -304,10 +480,52 @@ class Server:
                 "soundcard": SOUNDCARD_OK,
                 "system_subscribers": len(self.system_subscribers),
             }))
+        elif action == "rerank":
+            await self._handle_rerank(ws, cmd)
+        elif action == "extract_question":
+            await self._handle_extract(ws, cmd)
         else:
             await ws.send(json.dumps({"error": f"unknown action: {action}"}))
 
+    async def _handle_extract(self, ws, cmd):
+        query = cmd.get("query") or ""
+        loop = asyncio.get_running_loop()
+        try:
+            q = await loop.run_in_executor(None, _extract_question, query)
+        except Exception:
+            q = query
+        await ws.send(json.dumps({"question": q}))
+
+    async def _handle_rerank(self, ws, cmd):
+        query = (cmd.get("query") or "").strip()
+        items = cmd.get("items") or []
+        rr = _get_reranker()
+        if not (rr and query and items):
+            await ws.send(json.dumps({"scores": None}))
+            return
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            pairs = [[query, _doc_text(it.get("path", ""), it.get("heading", ""))] for it in items]
+            ce = rr.predict(pairs, show_progress_bar=False)
+            out = []
+            for s, it in zip(ce, items):
+                b = _title_bonus(query, it.get("path", ""), it.get("heading", ""))
+                out.append(float(s) + RERANK_TITLE_BOOST * b)
+            return out
+
+        try:
+            scores = await loop.run_in_executor(None, _run)
+            await ws.send(json.dumps({"scores": scores}))
+            log.info(f"reranked {len(items)} items")
+        except Exception as e:
+            log.warning(f"rerank failed: {e}")
+            await ws.send(json.dumps({"scores": None}))
+
     async def handle_audio_frame(self, ws, frame):
+        if self.transcriber is None:
+            await ws.send(json.dumps({"error": "whisper disabled"}))
+            return
         if len(frame) < HEADER_LEN:
             await ws.send(json.dumps({"error": "frame too short"}))
             return
@@ -348,15 +566,31 @@ async def main():
     ap.add_argument("--compute-type", default="auto")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--no-system-audio", action="store_true")
+    ap.add_argument("--no-whisper", action="store_true",
+                    help="Не грузить Whisper (STT через Deepgram); сидкар только для rerank/extract")
     args = ap.parse_args()
 
-    transcriber = Transcriber(args.model, args.device, args.compute_type, args.language)
+    if args.no_whisper:
+        log.info("Whisper OFF (--no-whisper): сидкар обслуживает только rerank/extract")
+        transcriber = None
+    else:
+        transcriber = Transcriber(args.model, args.device, args.compute_type, args.language)
     server = Server(transcriber)
+
+    # Извлекатель вопроса работает через Ollama (ОТДЕЛЬНЫЙ процесс) — torch в этот
+    # процесс не грузится, конфликта с ctranslate2-Whisper нет. Безопасно греть всегда.
+    if EXTRACT_ENABLED:
+        threading.Thread(target=lambda: _extract_question("прогрев модели"), daemon=True).start()
+    # Реранкер грузит torch В ЭТОТ процесс. Рядом с Whisper на 6 ГБ это роняло
+    # сидкар (CUDA-конфликт/OOM) → греем ТОЛЬКО когда Whisper выключен (--no-whisper)
+    # или явно попросили (SIDECAR_PREWARM=1).
+    if args.no_whisper or os.getenv("SIDECAR_PREWARM", "0") == "1":
+        threading.Thread(target=_get_reranker, daemon=True).start()
 
     import queue
     sysaudio_queue = queue.Queue(maxsize=20)
     stop_event = threading.Event()
-    if not args.no_system_audio and SOUNDCARD_OK:
+    if not args.no_system_audio and not args.no_whisper and SOUNDCARD_OK:
         thread = threading.Thread(
             target=system_audio_capture_thread,
             args=(sysaudio_queue, stop_event),

@@ -26,3 +26,7 @@ enrolled_user.npy
 Thumbs.db
 .idea/
 .vscode/
+
+# Рабочие бэкапы main.js (не коммитить)
+main.js.bak*
+main.js.prev
