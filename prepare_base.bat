@@ -17,13 +17,20 @@ pause
 
 echo.
 echo [1/2] Скачиваю модели Ollama (при первом запуске ~1 ГБ + ~4.7 ГБ)...
-where ollama >nul 2>nul || (
-  echo.
-  echo [!] Ollama не найдена. Установи её: https://ollama.com/download
-  echo     После установки запусти этот файл ещё раз.
-  echo.
-  pause & exit /b 1
-)
+where ollama >nul 2>nul && goto have_ollama
+echo.
+echo Ollama не найдена - пробую установить автоматически (winget)...
+winget install -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements --disable-interactivity
+echo Жду запуск Ollama...
+timeout /t 8 >nul
+set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
+where ollama >nul 2>nul && goto have_ollama
+echo.
+echo [!] Не получилось поставить Ollama автоматически.
+echo     Поставь вручную: https://ollama.com/download  и запусти этот файл снова.
+echo.
+pause & exit /b 1
+:have_ollama
 echo   - qwen2.5:1.5b  (вытаскивает вопрос из речи при поиске)
 ollama pull qwen2.5:1.5b
 if errorlevel 1 ( echo [!] Не удалось получить qwen2.5:1.5b. & pause & exit /b 1 )
