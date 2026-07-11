@@ -2,51 +2,50 @@
 setlocal
 cd /d "%~dp0"
 set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
-chcp 65001 >nul
 
 echo ============================================================
-echo   Voice Vault Search - подготовка базы поиска
+echo   Voice Vault Search - prepare search base
 echo ============================================================
 echo.
-echo Разово генерирует блоки "Возможные вопросы" для заметок -
-echo это сильно улучшает точность поиска. Whisper тут не нужен.
+echo One-time step: generates "Possible questions" blocks for your
+echo notes (greatly improves search accuracy). Whisper is not needed.
 echo.
-echo ВАЖНО: закрой Obsidian, чтобы освободить видеопамять под модель.
+echo IMPORTANT: close Obsidian to free video memory for the model.
 echo.
 pause
 
 echo.
-echo [1/2] Скачиваю модели Ollama (при первом запуске ~1 ГБ + ~4.7 ГБ)...
+echo [1/2] Checking Ollama...
 where ollama >nul 2>nul && goto have_ollama
-echo.
-echo Ollama не найдена - пробую установить автоматически (winget)...
+echo Ollama not found - trying to install it automatically (winget)...
 winget install -e --id Ollama.Ollama --accept-package-agreements --accept-source-agreements --disable-interactivity
-echo Жду запуск Ollama...
+echo Waiting for Ollama to start...
 timeout /t 8 >nul
-set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
 where ollama >nul 2>nul && goto have_ollama
 echo.
-echo [!] Не получилось поставить Ollama автоматически.
-echo     Поставь вручную: https://ollama.com/download  и запусти этот файл снова.
+echo [!] Could not install Ollama automatically.
+echo     Install it from https://ollama.com/download and run this file again.
 echo.
-pause & exit /b 1
+pause
+exit /b 1
 :have_ollama
-echo   - qwen2.5:1.5b  (вытаскивает вопрос из речи при поиске)
+
+echo Downloading models (first run: ~1 GB + ~4.7 GB)...
+echo   - qwen2.5:1.5b  (extracts the question from speech during search)
 ollama pull qwen2.5:1.5b
-if errorlevel 1 ( echo [!] Не удалось получить qwen2.5:1.5b. & pause & exit /b 1 )
-echo   - qwen2.5:7b-instruct  (генерация вопросов для заметок)
+if errorlevel 1 ( echo [!] Failed to download qwen2.5:1.5b & pause & exit /b 1 )
+echo   - qwen2.5:7b-instruct  (generates questions for notes)
 ollama pull qwen2.5:7b-instruct
-if errorlevel 1 ( echo [!] Не удалось получить qwen2.5:7b-instruct. & pause & exit /b 1 )
+if errorlevel 1 ( echo [!] Failed to download qwen2.5:7b-instruct & pause & exit /b 1 )
 
 echo.
-echo [2/2] Генерирую вопросы для заметок ^(разово, подожди несколько минут^)...
-if not exist ".venv\Scripts\python.exe" ( echo [!] Сначала запусти setup.bat ^(нет .venv^). & pause & exit /b 1 )
+echo [2/2] Generating questions for notes (one-time, please wait a few minutes)...
+if not exist ".venv\Scripts\python.exe" ( echo [!] Run setup.bat first ^(no .venv^). & pause & exit /b 1 )
 ".venv\Scripts\python.exe" generate_questions.py --apply
 
 echo.
 echo ============================================================
-echo   Готово! Открой Obsidian и нажми Reindex в панели плагина,
-echo   чтобы поиск подхватил новые вопросы.
+echo   Done! Open Obsidian and press Reindex in the plugin panel.
 echo ============================================================
 echo.
 pause
